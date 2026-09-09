@@ -4,8 +4,12 @@
 Keeps every reading row. Marker rows (label_change, profile_change, etc.)
 are ignored — nothing is trimmed after a label swap.
 
-One line per heater profile, with filled markers colored by heater_step
-(parula). Label spans are drawn as background bands.
+By default, gas resistance and humidity are averaged across all sensors
+in 1 s bins. Pass --ref-sensor N to plot one logical_id instead.
+
+One scatter series per heater profile (face = heater_step via jet;
+edge = protocol). Label spans are drawn as background bands; humidity
+on the right y-axis.
 
 Usage:
     python analysis/pretty_raw_plots.py path/to/bme688_log_YYYYMMDD_HHMMSS.csv
@@ -22,7 +26,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import LinearSegmentedColormap, Normalize
+from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
@@ -37,85 +41,14 @@ LABEL_DISPLAY = {
     "CLEAN": "CLEAN",
     "SOILED": "SOILED",
 }
-# Distinct line colors so the four protocols stay readable under parula markers.
+# Distinct edge colors so protocols stay readable under jet-filled markers.
 PROFILE_LINE_COLORS = (
     "#1b1b1b",
     "#2a6f97",
     "#6a4c93",
     "#bc4749",
 )
-
-# MATLAB-like parula stops (RGB in 0–1).
-_PARULA_STOPS = [
-    (0.2081, 0.1663, 0.5292),
-    (0.2116, 0.1898, 0.5777),
-    (0.2123, 0.2138, 0.6270),
-    (0.2082, 0.2386, 0.6771),
-    (0.1959, 0.2645, 0.7279),
-    (0.1707, 0.2919, 0.7792),
-    (0.1253, 0.3242, 0.8303),
-    (0.0591, 0.3598, 0.8683),
-    (0.0117, 0.3875, 0.8820),
-    (0.0060, 0.4086, 0.8828),
-    (0.0165, 0.4266, 0.8786),
-    (0.0329, 0.4430, 0.8720),
-    (0.0498, 0.4586, 0.8641),
-    (0.0629, 0.4737, 0.8554),
-    (0.0723, 0.4887, 0.8467),
-    (0.0779, 0.5040, 0.8384),
-    (0.0793, 0.5200, 0.8312),
-    (0.0749, 0.5375, 0.8263),
-    (0.0641, 0.5570, 0.8240),
-    (0.0488, 0.5772, 0.8218),
-    (0.0343, 0.5966, 0.8197),
-    (0.0265, 0.6137, 0.8183),
-    (0.0239, 0.6287, 0.8198),
-    (0.0231, 0.6418, 0.8262),
-    (0.0228, 0.6535, 0.8395),
-    (0.0267, 0.6642, 0.8599),
-    (0.0433, 0.6743, 0.8869),
-    (0.0788, 0.6872, 0.9046),
-    (0.1273, 0.7033, 0.9013),
-    (0.1803, 0.7210, 0.8860),
-    (0.2334, 0.7385, 0.8661),
-    (0.2849, 0.7550, 0.8449),
-    (0.3346, 0.7703, 0.8230),
-    (0.3832, 0.7846, 0.8005),
-    (0.4310, 0.7983, 0.7771),
-    (0.4783, 0.8115, 0.7526),
-    (0.5254, 0.8243, 0.7268),
-    (0.5726, 0.8367, 0.6994),
-    (0.6201, 0.8486, 0.6702),
-    (0.6682, 0.8598, 0.6389),
-    (0.7168, 0.8701, 0.6051),
-    (0.7659, 0.8794, 0.5684),
-    (0.8152, 0.8875, 0.5282),
-    (0.8641, 0.8941, 0.4840),
-    (0.9115, 0.8988, 0.4348),
-    (0.9557, 0.9006, 0.3794),
-    (0.9853, 0.9000, 0.3219),
-    (0.9958, 0.9012, 0.2727),
-    (0.9888, 0.9124, 0.2421),
-    (0.9735, 0.9331, 0.2325),
-    (0.9560, 0.9530, 0.2360),
-    (0.9422, 0.9679, 0.2473),
-    (0.9339, 0.9769, 0.2652),
-    (0.9299, 0.9809, 0.2866),
-    (0.9279, 0.9819, 0.3075),
-    (0.9259, 0.9811, 0.3259),
-    (0.9230, 0.9790, 0.3418),
-    (0.9185, 0.9760, 0.3556),
-    (0.9123, 0.9725, 0.3681),
-    (0.9048, 0.9686, 0.3796),
-    (0.8963, 0.9644, 0.3905),
-    (0.8872, 0.9599, 0.4010),
-    (0.8778, 0.9551, 0.4114),
-    (0.8684, 0.9500, 0.4218),
-]
-
-
-def parula_cmap() -> LinearSegmentedColormap:
-    return LinearSegmentedColormap.from_list("parula", _PARULA_STOPS, N=256)
+HUMIDITY_COLOR = "#000000"
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,13 +66,25 @@ def parse_args() -> argparse.Namespace:
         "--ref-sensor",
         type=int,
         default=None,
-        help="logical_id to plot (default: lowest present)",
+        help="Plot one logical_id only (default: mean across all sensors)",
     )
     p.add_argument(
         "--gap-sec",
         type=float,
         default=60.0,
         help="Break a profile line when samples are farther apart than this (default: 60)",
+    )
+    p.add_argument(
+        "--bin-ms",
+        type=float,
+        default=1000.0,
+        help="When averaging sensors, time-bin width in ms (default: 1000)",
+    )
+    p.add_argument(
+        "--rh-smooth-sec",
+        type=float,
+        default=100.0,
+        help="Centered rolling-mean window for humidity in seconds (default: 100)",
     )
     return p.parse_args()
 
@@ -156,6 +101,7 @@ def load_readings(path: Path) -> pd.DataFrame:
         "profile_name",
         "heater_step",
         "gas_resistance_ohm",
+        "humidity_pct",
     }
     missing = needed - set(df.columns)
     if missing:
@@ -173,6 +119,7 @@ def load_readings(path: Path) -> pd.DataFrame:
         "profile_id",
         "heater_step",
         "gas_resistance_ohm",
+        "humidity_pct",
     ):
         data[c] = pd.to_numeric(data[c], errors="coerce")
     data["label_name"] = data["label_name"].astype(str).str.strip().str.upper()
@@ -234,7 +181,6 @@ def break_on_gaps(
 
 def shade_labels(ax, spans: list[tuple[str, float, float]], t0: float) -> None:
     for lab, a, b in spans:
-        # Extend each band halfway to the next sample so swaps look contiguous.
         ax.axvspan(
             (a - t0) / 60_000.0,
             (b - t0) / 60_000.0,
@@ -245,15 +191,80 @@ def shade_labels(ax, spans: list[tuple[str, float, float]], t0: float) -> None:
         )
 
 
+def _mode_label(s: pd.Series) -> str:
+    m = s.mode()
+    return str(m.iloc[0] if len(m) else s.iloc[0])
+
+
+def prepare_series(
+    data: pd.DataFrame,
+    ref_sensor: int | None,
+    bin_ms: float,
+) -> tuple[pd.DataFrame, str]:
+    """Return plot series and a short sensor description for the title."""
+    if ref_sensor is not None:
+        sub = data[data["logical_id"] == ref_sensor].sort_values("millis")
+        if sub.empty:
+            raise SystemExit(f"No rows for logical_id={ref_sensor}")
+        return sub, f"logical_id={ref_sensor}"
+
+    d = data.copy()
+    d["t_bin"] = (d["millis"] // bin_ms) * bin_ms
+    sub = (
+        d.groupby(
+            ["t_bin", "profile_id", "profile_name", "heater_step"],
+            as_index=False,
+        )
+        .agg(
+            millis=("millis", "mean"),
+            log_r=("log_r", "mean"),
+            humidity_pct=("humidity_pct", "mean"),
+            label_name=("label_name", _mode_label),
+            n_sensors=("logical_id", "nunique"),
+        )
+        .sort_values("millis")
+    )
+    n = int(data["logical_id"].nunique())
+    return sub, f"mean of {n} sensors"
+
+
+def humidity_series(
+    data: pd.DataFrame,
+    ref_sensor: int | None,
+    bin_ms: float,
+    smooth_sec: float,
+) -> pd.DataFrame:
+    """Mean humidity per time bin, then centered rolling smooth."""
+    src = data if ref_sensor is None else data[data["logical_id"] == ref_sensor]
+    src = src.dropna(subset=["humidity_pct"]).copy()
+    src["t_bin"] = (src["millis"] // bin_ms) * bin_ms
+    rh = (
+        src.groupby("t_bin", as_index=False)
+        .agg(millis=("millis", "mean"), humidity_pct=("humidity_pct", "mean"))
+        .sort_values("millis")
+    )
+    if rh.empty or smooth_sec <= 0 or bin_ms <= 0:
+        return rh
+    win = max(1, int(round(smooth_sec * 1000.0 / bin_ms)))
+    if win % 2 == 0:
+        win += 1
+    rh["humidity_pct"] = (
+        rh["humidity_pct"].rolling(window=win, center=True, min_periods=1).mean()
+    )
+    return rh
+
+
 def plot_raw(
     data: pd.DataFrame,
     out: Path,
-    ref_sensor: int,
+    ref_sensor: int | None,
     gap_sec: float,
+    bin_ms: float,
+    rh_smooth_sec: float,
 ) -> Path:
-    sub = data[data["logical_id"] == ref_sensor].sort_values("millis")
+    sub, sensor_desc = prepare_series(data, ref_sensor, bin_ms)
     if sub.empty:
-        raise SystemExit(f"No rows for logical_id={ref_sensor}")
+        raise SystemExit("No rows to plot after sensor selection/averaging")
 
     profiles = (
         sub.groupby(["profile_id", "profile_name"], sort=True)
@@ -264,13 +275,12 @@ def plot_raw(
     if profiles.empty:
         raise SystemExit("No heater profiles found in readings")
 
-    t0 = float(sub["millis"].min())
-    spans = label_spans(sub)
-    cmap = parula_cmap()
+    t0 = float(data["millis"].min())
+    spans = label_spans(data)
+    cmap = plt.get_cmap("jet")
     norm = Normalize(vmin=0, vmax=9)
-    gap_min = gap_sec / 60.0
 
-    fig, ax = plt.subplots(figsize=(14, 5.5))
+    fig, ax = plt.subplots(figsize=(14, 6.5))
     shade_labels(ax, spans, t0)
 
     for i, row in enumerate(profiles.itertuples(index=False)):
@@ -280,18 +290,7 @@ def plot_raw(
             continue
         t_min = (sl["millis"].to_numpy(dtype=float) - t0) / 60_000.0
         y = sl["log_r"].to_numpy(dtype=float)
-        t_line, y_line = break_on_gaps(t_min, y, gap_min)
-        line_color = PROFILE_LINE_COLORS[i % len(PROFILE_LINE_COLORS)]
-        ax.plot(
-            t_line,
-            y_line,
-            color=line_color,
-            linewidth=1.1,
-            alpha=0.85,
-            solid_capstyle="round",
-            zorder=2,
-            label=pname,
-        )
+        edge = PROFILE_LINE_COLORS[i % len(PROFILE_LINE_COLORS)]
         ax.scatter(
             t_min,
             y,
@@ -300,60 +299,101 @@ def plot_raw(
             norm=norm,
             s=28,
             marker="o",
-            edgecolors="white",
-            linewidths=0.35,
+            edgecolors=edge,
+            linewidths=0.45,
             zorder=3,
         )
 
+    ax_rh = ax.twinx()
+    rh = humidity_series(data, ref_sensor, bin_ms, rh_smooth_sec)
+    if not rh.empty:
+        t_rh = (rh["millis"].to_numpy(dtype=float) - t0) / 60_000.0
+        y_rh = rh["humidity_pct"].to_numpy(dtype=float)
+        ax_rh.plot(
+            t_rh,
+            y_rh,
+            color=HUMIDITY_COLOR,
+            linewidth=1.8,
+            alpha=0.95,
+            zorder=1,
+            label="humidity",
+        )
+    ax_rh.set_ylabel("humidity (%RH)", color=HUMIDITY_COLOR)
+    ax_rh.tick_params(axis="y", colors=HUMIDITY_COLOR)
+    ax_rh.spines["right"].set_color(HUMIDITY_COLOR)
+
     ax.set_xlabel("minutes from first sample")
     ax.set_ylabel("log10(gas resistance / ohm)")
-    ax.set_title(
-        f"Raw heater-sweep time series  ·  logical_id={ref_sensor}  ·  "
-        "lines = protocol, markers = heater_step (parula)"
+    fig.suptitle(
+        f"Raw heater-sweep time series  ·  {sensor_desc}",
+        y=0.98,
+        fontsize=12,
     )
 
     cbar = fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap=cmap),
-        ax=ax,
-        pad=0.015,
+        ax=[ax, ax_rh],
+        pad=0.08,
         fraction=0.03,
     )
     cbar.set_label("heater_step")
     cbar.set_ticks(range(10))
 
     protocol_handles = [
-        Line2D([0], [0], color=PROFILE_LINE_COLORS[i % len(PROFILE_LINE_COLORS)], lw=1.5)
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="none",
+            markerfacecolor="#888888",
+            markeredgecolor=PROFILE_LINE_COLORS[i % len(PROFILE_LINE_COLORS)],
+            markeredgewidth=1.2,
+            markersize=7,
+            linestyle="none",
+        )
         for i in range(len(profiles))
     ]
     protocol_labels = [str(r.profile_name) for r in profiles.itertuples(index=False)]
+    protocol_handles.append(Line2D([0], [0], color=HUMIDITY_COLOR, lw=1.8))
+    protocol_labels.append("humidity")
     label_handles = [
-        Patch(facecolor=LABEL_COLORS[lab], edgecolor="none", alpha=0.35, label=LABEL_DISPLAY[lab])
+        Patch(
+            facecolor=LABEL_COLORS[lab],
+            edgecolor="none",
+            alpha=0.35,
+            label=LABEL_DISPLAY[lab],
+        )
         for lab in LABELS
         if any(s[0] == lab for s in spans)
     ]
-    leg1 = ax.legend(
-        protocol_handles,
-        protocol_labels,
-        title="protocol",
-        loc="upper left",
-        framealpha=0.92,
+
+    # Single legend row above the axes (outside the plot box, inside the figure).
+    all_handles = protocol_handles + label_handles
+    all_labels = protocol_labels + [
+        f"bg: {LABEL_DISPLAY[lab]}"
+        for lab in LABELS
+        if any(s[0] == lab for s in spans)
+    ]
+    ax.legend(
+        all_handles,
+        all_labels,
+        loc="lower left",
+        bbox_to_anchor=(0.0, 1.01),
+        ncol=min(8, len(all_handles)),
+        frameon=False,
+        fontsize=8,
+        borderaxespad=0.0,
+        handlelength=1.6,
+        columnspacing=1.0,
     )
-    ax.add_artist(leg1)
-    if label_handles:
-        ax.legend(
-            handles=label_handles,
-            title="label (background)",
-            loc="upper right",
-            framealpha=0.92,
-        )
 
     ax.set_axisbelow(False)
     for spine in ax.spines.values():
         spine.set_zorder(4)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.07, right=0.82, top=0.82, bottom=0.10)
     out.mkdir(parents=True, exist_ok=True)
     path = out / "pretty_raw_timeseries.png"
-    fig.savefig(path, dpi=160)
+    fig.savefig(path, dpi=160, bbox_inches="tight", pad_inches=0.25)
     plt.close(fig)
     return path
 
@@ -366,18 +406,30 @@ def main() -> None:
         raise SystemExit("No reading rows after ignoring markers")
 
     sensors = sorted(data["logical_id"].unique().tolist())
-    ref = args.ref_sensor if args.ref_sensor is not None else sensors[0]
-    if ref not in sensors:
-        raise SystemExit(f"logical_id={ref} not in data; present: {sensors}")
+    if args.ref_sensor is not None and args.ref_sensor not in sensors:
+        raise SystemExit(
+            f"logical_id={args.ref_sensor} not in data; present: {sensors}"
+        )
 
     print(f"  reading rows : {len(data)}")
     print(f"  sensors      : {sensors}")
-    print(f"  ref sensor   : {ref}")
+    if args.ref_sensor is None:
+        print(f"  series       : mean across {len(sensors)} sensors (bin={args.bin_ms:g} ms)")
+    else:
+        print(f"  series       : logical_id={args.ref_sensor}")
+    print(f"  rh smooth    : {args.rh_smooth_sec:g} s")
     print(f"  duration     : {(data['millis'].max() - data['millis'].min()) / 60_000.0:.1f} min")
     for lab, n in data["label_name"].value_counts().reindex(LABELS, fill_value=0).items():
         print(f"    {lab:<8} {int(n):>6} rows")
 
-    path = plot_raw(data, args.out, ref, args.gap_sec)
+    path = plot_raw(
+        data,
+        args.out,
+        args.ref_sensor,
+        args.gap_sec,
+        args.bin_ms,
+        args.rh_smooth_sec,
+    )
     print(f"Wrote {path}")
 
 
