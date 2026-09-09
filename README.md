@@ -63,8 +63,8 @@ The RTC keeps time on its coin cell afterward, so this is normally a one-off.
    `CLEAN`. Leave it for ~1 hour.
 4. Press **Button B** (GPIO 32) whenever something worth marking happens
    (cage opened, bedding added, etc.) — it drops a timestamped event row.
-5. Power down, pull the microSD card, analyze
-   `bme688_log_YYYYMMDD_HHMMSS.csv`.
+5. Power down, pull the microSD card, then run the analysis script (see
+   [Analyze](#analyze)).
 
 ## Configuration
 
@@ -101,6 +101,30 @@ hasn't settled yet. The `profile_cycle` column makes this a one-line filter.
 Then compare `gas_resistance_ohm` between labels, grouped by
 `(profile_id, heater_step)`, to see which heater conditions separate
 "soiled" from "clean" best relative to within-label spread.
+
+`UNKNOWN` is ambient air (board out of the cage), not discarded data. Keep it
+when you look at how room air sits next to both cages.
+
+## Analyze
+
+The script in [`analysis/analyze_cage.py`](analysis/analyze_cage.py) loads one
+labeled CSV, drops the minutes after each cage/label swap, plots all three
+labels (UNKNOWN = air, CLEAN, SOILED), then trains a **CLEAN vs SOILED**
+classifier with a time-based holdout.
+
+```sh
+pip install -r requirements.txt
+python analysis/analyze_cage.py path/to/bme688_log_YYYYMMDD_HHMMSS.csv
+```
+
+Useful flags:
+
+- `--drop-after-label-min 10` — minutes of mixed air to drop after each `label_change` (default 10). The rest of each UNKNOWN block is kept as air.
+- `--test-frac 0.3` — last fraction of each CLEAN and SOILED block used as the test set (not a shuffled split).
+- `--out analysis/out` — where plots and CSVs are written.
+- `--ref-sensor 0` — `logical_id` for the time-series plots.
+
+Writes `heater_step_scores.csv`, `fingerprints.csv`, `metrics.csv`, and three PNGs under `--out`. UNKNOWN is scored after training as mean P(SOILED) so you can see whether air looks like a cage class; it is not part of accuracy.
 
 ## Data rate
 

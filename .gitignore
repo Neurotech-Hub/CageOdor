@@ -4,3 +4,5 @@ Thumbs.db
 *.bin
 *.elf
 *.map
+# *.csv
+analysis/out/
