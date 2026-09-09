@@ -1,4 +1,5 @@
 .claude/
+.venv/
 .DS_Store
 Thumbs.db
 *.bin

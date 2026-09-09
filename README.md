@@ -113,6 +113,8 @@ labels (UNKNOWN = air, CLEAN, SOILED), then trains a **CLEAN vs SOILED**
 classifier with a time-based holdout.
 
 ```sh
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python analysis/analyze_cage.py path/to/bme688_log_YYYYMMDD_HHMMSS.csv
 ```
