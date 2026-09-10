@@ -3,8 +3,8 @@
 Firmware for the Bosch BME688 Development Kit (Adafruit HUZZAH32 ESP32
 Feather + 8×BME688 shield) that sweeps the gas-heater profile across all 8
 sensors and logs raw temperature / humidity / pressure / gas-resistance data
-to microSD, to see whether the sensor can distinguish a soiled cage from a
-clean one.
+to microSD, to see whether the sensor can distinguish **clean**, **wet**,
+and **soiled** cages from each other and from room **air**.
 
 This deliberately does **not** use Bosch's BME AI Studio / BSEC2 — no
 `.bmeconfig` blobs, no proprietary IAQ index. It uses the plain
@@ -53,8 +53,9 @@ python -c "import time; print(int(time.time()))"
 
 The RTC keeps time on its coin cell afterward, so this is normally a one-off.
 
-## Running the soiled-vs-clean experiment
+## Running the cage-odor experiment
 
+<<<<<<< Updated upstream
 1. Power the board from a USB battery pack. Wait for the LED to stop
    blinking (SD + sensors OK) — logging starts automatically.
 2. Place the board in the soiled cage. Press **Button A** (GPIO 14) until
@@ -65,6 +66,30 @@ The RTC keeps time on its coin cell afterward, so this is normally a one-off.
    (cage opened, bedding added, etc.) — it drops a timestamped event row.
 5. Power down, pull the microSD card, then run the analysis script (see
    [Analyze](#analyze)).
+=======
+Classes: **AIR** (unlabeled / room air), **CLEAN**, **WET**, **SOILED**.
+
+1. Power the board (USB battery pack, or leave it plugged in for serial
+   control). Once logging starts the LED shows the current label:
+   - breathing = AIR
+   - two blinks / 10 s = CLEAN
+   - three blinks / 10 s = WET
+   - four blinks / 10 s = SOILED
+   - fast continuous blink = SD card failed
+2. AIR is the default at boot. Leave it in room air for a baseline, or type
+   `air` / cycle **Button A** until the LED breathes.
+3. Place the board in the clean cage. Set **CLEAN** (Button A, or type
+   `clean`). Leave it for ~1 hour.
+4. For the wet condition, set **WET** (`wet` or Button A). Each time you add
+   10 mL of water to the cage, press **Button B** (or type `mark`) — that
+   writes a `water_10ml` marker row.
+5. Place the board in the soiled cage. Set **SOILED** (`soiled`). Leave it
+   for ~1 hour.
+6. Other events (cage opened, bedding added): Button B while not on WET, or
+   `mark cage_open`.
+7. Power down, pull the microSD card, analyze
+   `bme688_log_YYYYMMDD_HHMMSS.csv`.
+>>>>>>> Stashed changes
 
 ## Configuration
 
@@ -86,8 +111,8 @@ variance.
 One header row, preceded by `#`-commented metadata (firmware version,
 session start time, detected sensor unique IDs, and the full profile table
 actually used). Data rows and marker rows (`label_change`, `event_marker`,
-`profile_change`, `session_start`) share one schema, so `pandas.read_csv`
-loads the whole file in one call:
+`water_10ml`, `profile_change`, `session_start`) share one schema, so
+`pandas.read_csv` loads the whole file in one call:
 
 ```python
 import pandas as pd
@@ -100,7 +125,7 @@ markers = df[df.marker.notna()] # label changes / events
 hasn't settled yet. The `profile_cycle` column makes this a one-line filter.
 Then compare `gas_resistance_ohm` between labels, grouped by
 `(profile_id, heater_step)`, to see which heater conditions separate
-"soiled" from "clean" best relative to within-label spread.
+AIR / CLEAN / WET / SOILED best relative to within-label spread.
 
 `UNKNOWN` is ambient air (board out of the cage), not discarded data. Keep it
 when you look at how room air sits next to both cages.

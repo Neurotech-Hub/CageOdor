@@ -16,9 +16,20 @@
  *   sensor, which profile, which heater step, what temperature and dwell that
  *   step used, and what experiment label was active.
  *
- *   Two on-board buttons label the data while an experiment runs:
- *     Button A (GPIO 14) : cycle label UNKNOWN -> CLEAN -> SOILED -> UNKNOWN
- *     Button B (GPIO 32) : drop a generic event marker row
+ *   Two on-board buttons label the data while an experiment runs, and the
+ *   same actions (plus a few more) are available over USB serial:
+ *     Button A (GPIO 14) : cycle label AIR -> CLEAN -> WET -> SOILED -> AIR
+ *     Button B (GPIO 32) : event marker. While WET, this records
+ *                          `water_10ml` (10 mL water added to the cage);
+ *                          otherwise a generic `event_marker`.
+ *     Serial (115200)    : type `help` for the command list. You can set a
+ *                          label directly (`air`, `clean`, `wet`, `soiled`),
+ *                          drop a named marker (`mark cage_open`), pick a
+ *                          heater profile, or pause profile rotation.
+ *     LED (GPIO 13)      : after logging starts, the pattern is the label:
+ *                          breathe = AIR, 2 blinks/10s = CLEAN,
+ *                          3 blinks/10s = WET, 4 blinks/10s = SOILED.
+ *                          Fast blink = SD fail.
  *
  *   This sketch deliberately does NOT use BSEC2 / BME AI Studio. There are no
  *   .bmeconfig blobs and no IAQ index (IAQ only exists inside BSEC2). What you
@@ -54,16 +65,27 @@
  *   Get it from: python -c "import time; print(int(time.time()))"
  *   The RTC keeps time on its coin cell afterwards, so this is a one-off.
  *
- * RUNNING THE SOILED-vs-CLEAN EXPERIMENT
- *   1. Power the board from a USB battery pack. Wait for the LED to stop
- *      blinking (SD + sensors OK) and for logging to start.
- *   2. Place the board in the soiled cage. Press Button A until the serial
- *      output reads SOILED. Leave it for ~1 hour.
- *   3. Move the board to the clean cage. Press Button A until it reads CLEAN.
+ * RUNNING THE CAGE-ODOR EXPERIMENT
+ *   Classes: AIR (unlabeled / room air), CLEAN, WET, SOILED.
+ *   1. Power the board (USB battery pack, or leave it plugged in if you want
+ *      serial control). Once logging starts the LED shows the current label:
+ *        breathing          = AIR
+ *        two blinks / 10 s   = CLEAN
+ *        three blinks / 10 s = WET
+ *        four blinks / 10 s  = SOILED
+ *      A fast continuous blink means the SD card failed.
+ *   2. AIR is the default at boot. Leave it in room air if you want a
+ *      baseline, or type `air` / cycle Button A until the LED breathes.
+ *   3. Place the board in the clean cage. Set CLEAN (Button A, or `clean`).
  *      Leave it for ~1 hour.
- *   4. Press Button B whenever you do something worth marking (opened the
- *      cage, added bedding, walked past). Those rows are recoverable later.
- *   5. Power down, pull the card, analyse bme688_log_YYYYMMDD_HHMMSS.csv.
+ *   4. For the wet condition, set WET (`wet` or Button A). Each time you add
+ *      10 mL of water to the cage, press Button B (or type `mark`) — that
+ *      writes a `water_10ml` marker row.
+ *   5. Place the board in the soiled cage. Set SOILED (`soiled`). Leave it
+ *      for ~1 hour.
+ *   6. Other events (opened the cage, added bedding): Button B while not on
+ *      WET, or `mark cage_open`. Those rows are recoverable later.
+ *   7. Power down, pull the card, analyse bme688_log_YYYYMMDD_HHMMSS.csv.
  *
  * ANALYSIS HINT
  *   The '#' metadata lines at the top of the CSV are comments:
@@ -73,9 +95,10 @@
  *   settled yet. That is what the profile_cycle column is for:
  *     data = df[df.marker.isna() & (df.profile_cycle > df.groupby(
  *                 ['profile_id']).profile_cycle.transform('min'))]
- *   Then compare gas_resistance_ohm between labels, grouped by
- *   (profile_id, heater_step). The heater conditions showing the largest
- *   separation relative to within-label spread are the ones worth keeping.
+ *   Then compare gas_resistance_ohm between labels (AIR / CLEAN / WET /
+ *   SOILED), grouped by (profile_id, heater_step). The heater conditions
+ *   showing the largest separation relative to within-label spread are the
+ *   ones worth keeping.
  *
  * DATA RATE
  *   8 sensors x 10 steps per ~1.4 s ~= 57 rows/s ~= 7 kB/s.
@@ -84,6 +107,7 @@
  ******************************************************************************/
 
 #include <Arduino.h>
+#include <math.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
@@ -98,7 +122,7 @@
  * ===========================================================================
  */
 
-#define FW_VERSION "cage-odor-1.0.0"
+#define FW_VERSION "cage-odor-1.3.0"
 
 /* --- Pins. Fixed by the dev-kit shield; change only if you rewire. -------- */
 static const uint8_t PIN_SD_CS = 33;           /* microSD chip select        */
@@ -181,6 +205,20 @@ static const char *LOG_BASE_NAME = "bme688_log";      /* filename prefix     */
 /* --- Serial monitoring --------------------------------------------------- */
 static const uint32_t SERIAL_SUMMARY_MS = 5000UL;  /* summary line interval  */
 static const uint8_t  REFERENCE_SENSOR  = 0;       /* which sensor to print  */
+static const size_t   SERIAL_LINE_MAX   = 48;      /* incoming command line  */
+
+/* --- LED (label patterns, after logging starts) --------------------------
+ * AIR     : sine-wave breathe
+ * CLEAN   : 2 blinks every LED_GROUP_PERIOD_MS (500 ms between blinks)
+ * WET     : 3 blinks every LED_GROUP_PERIOD_MS
+ * SOILED  : 4 blinks every LED_GROUP_PERIOD_MS
+ * SD fail : fast continuous blink (overrides the label pattern)
+ */
+static const uint16_t LED_BREATHE_MS      = 2500;
+static const uint16_t LED_GROUP_PERIOD_MS = 10000; /* pause between indications */
+static const uint16_t LED_BLINK_ON_MS     = 70;
+static const uint16_t LED_BLINK_OFF_MS    = 500;   /* gap inside a burst      */
+static const uint16_t LED_ERROR_MS        = 150;
 
 /* --- Tuning (rarely changed) --------------------------------------------- */
 static const uint16_t BTN_DEBOUNCE_MS  = 50;
@@ -192,14 +230,26 @@ static const uint32_t SD_FLUSH_MS      = 2000UL;   /* ...or this often       */
  * ===========================================================================
  */
 
-/* Experiment labels. Numeric values land in the CSV, so keep them stable. */
+/* Experiment labels. Numeric values land in the CSV, so keep them stable.
+ * AIR was formerly logged as UNKNOWN (same id 0). WET was added as 3 so
+ * existing CLEAN=1 / SOILED=2 files stay comparable. */
 enum ExperimentLabel : uint8_t {
-  LABEL_UNKNOWN = 0,
-  LABEL_CLEAN   = 1,
-  LABEL_SOILED  = 2,
-  LABEL_COUNT   = 3
+  LABEL_AIR    = 0,
+  LABEL_CLEAN  = 1,
+  LABEL_SOILED = 2,
+  LABEL_WET    = 3,
+  LABEL_COUNT  = 4
 };
-static const char *LABEL_NAMES[LABEL_COUNT] = { "UNKNOWN", "CLEAN", "SOILED" };
+static const char *LABEL_NAMES[LABEL_COUNT] = { "AIR", "CLEAN", "SOILED", "WET" };
+
+/* Button A cycles in experimental order, not numeric id order. */
+static const uint8_t LABEL_CYCLE[] = {
+  LABEL_AIR, LABEL_CLEAN, LABEL_WET, LABEL_SOILED
+};
+static const uint8_t N_LABEL_CYCLE = sizeof(LABEL_CYCLE) / sizeof(LABEL_CYCLE[0]);
+
+/* Marker written by Button B / bare `mark` while the WET label is active. */
+static const char *WET_WATER_MARKER = "water_10ml";
 
 /* --- Globals ------------------------------------------------------------- */
 static Bme68x   bme[N_KIT_SENS];
@@ -220,8 +270,9 @@ static char     logPath[64] = { 0 };
 static String   sdBuf;
 static uint32_t lastSdFlushMs = 0;
 
-static uint8_t  currentLabel   = LABEL_UNKNOWN;
+static uint8_t  currentLabel   = LABEL_AIR;
 static uint8_t  currentProfile = 0;
+static bool     profileRotate  = true; /* false = hold the current profile  */
 static uint32_t profileCycle   = 0;   /* increments on every profile apply  */
 static uint32_t profileStartMs = 0;
 static uint32_t lastSampleMs   = 0;
@@ -236,10 +287,16 @@ static uint16_t currentStepDurMs[10];
 static bool     btnAPrev = true, btnBPrev = true;
 static uint32_t btnALastMs = 0, btnBLastMs = 0;
 
-/* LED error blink state. */
-static uint32_t ledLastMs   = 0;
-static bool     ledState    = false;
-static uint32_t ledFlashUntil = 0;
+/* Incoming serial command line (built char-by-char in the loop). */
+static char   serialLine[SERIAL_LINE_MAX];
+static size_t serialLineLen = 0;
+
+/* LED state. Patterns run only after logging starts. */
+static bool     loggingRun      = false;
+static uint32_t ledPatternStartMs = 0;
+static uint32_t ledLastMs       = 0;
+static bool     ledState        = false;
+static uint32_t ledFlashUntil   = 0;
 
 /* ===========================================================================
  * Time helpers
@@ -295,29 +352,76 @@ static uint32_t readEpochFromSerial(uint32_t timeoutMs)
  * ===========================================================================
  */
 
+static void ledWrite(uint8_t bri)
+{
+  analogWrite(PIN_LED, bri);         /* 0-255; hardware PWM on the ESP32 */
+}
+
 static void ledFlash(uint16_t ms)
 {
   ledFlashUntil = millis() + ms;
 }
 
-/* Steady blink when SD is dead, brief flash on button press, else off. */
+static void ledResetPattern()
+{
+  ledPatternStartMs = millis();
+}
+
+/* True during the on-phase of a `blinks` burst inside each group period. */
+static bool ledInBurst(uint32_t now, uint8_t blinks)
+{
+  uint32_t t = (now - ledPatternStartMs) % LED_GROUP_PERIOD_MS;
+  uint16_t cycle = (uint16_t)(LED_BLINK_ON_MS + LED_BLINK_OFF_MS);
+  uint32_t burstMs = (uint32_t)blinks * cycle;
+  if (t >= burstMs) return false;
+  return (t % cycle) < LED_BLINK_ON_MS;
+}
+
+/* SD fail overrides everything. Marker ack is a brief solid-on. After
+ * logging starts, the pattern follows the experiment label. */
 static void serviceLed()
 {
   uint32_t now = millis();
 
   if (!sdOk) {                       /* error pattern: fast, obvious */
-    if (now - ledLastMs >= 150) {
+    if (now - ledLastMs >= LED_ERROR_MS) {
       ledLastMs = now;
       ledState  = !ledState;
-      digitalWrite(PIN_LED, ledState);
+      ledWrite(ledState ? 255 : 0);
     }
     return;
   }
 
   if (now < ledFlashUntil) {
-    digitalWrite(PIN_LED, HIGH);
-  } else {
-    digitalWrite(PIN_LED, LOW);
+    ledWrite(255);
+    return;
+  }
+
+  if (!loggingRun) {
+    ledWrite(0);
+    return;
+  }
+
+  switch (currentLabel) {
+    case LABEL_CLEAN:
+      ledWrite(ledInBurst(now, 2) ? 255 : 0);
+      break;
+    case LABEL_WET:
+      ledWrite(ledInBurst(now, 3) ? 255 : 0);
+      break;
+    case LABEL_SOILED:
+      ledWrite(ledInBurst(now, 4) ? 255 : 0);
+      break;
+    case LABEL_AIR:
+    default: {
+      /* 0.5*(1-cos) starts at 0 and rises — a breath in. Floor at 8 so
+       * the LED never quite goes dark while AIR is active. */
+      uint32_t t = (now - ledPatternStartMs) % LED_BREATHE_MS;
+      float x = (2.0f * 3.14159265f * (float)t) / (float)LED_BREATHE_MS;
+      float s = 0.5f * (1.0f - cosf(x));
+      ledWrite((uint8_t)(8.0f + s * 247.0f));
+      break;
+    }
   }
 }
 
@@ -605,6 +709,173 @@ static void applyProfile(uint8_t idx)
 }
 
 /* ===========================================================================
+ * Experiment control (shared by buttons and serial)
+ * ===========================================================================
+ */
+
+static void setLabel(uint8_t label)
+{
+  if (label >= LABEL_COUNT) return;
+  if (label == currentLabel) {
+    Serial.printf("[LABEL] already %s\n", LABEL_NAMES[currentLabel]);
+    return;
+  }
+  currentLabel = label;
+  Serial.printf("\n[LABEL] now %s\n", LABEL_NAMES[currentLabel]);
+  logMarker("label_change");
+  ledResetPattern();                 /* start the new pattern immediately */
+}
+
+static void cycleLabel()
+{
+  uint8_t pos = 0;
+  for (uint8_t i = 0; i < N_LABEL_CYCLE; i++) {
+    if (LABEL_CYCLE[i] == currentLabel) {
+      pos = i;
+      break;
+    }
+  }
+  setLabel(LABEL_CYCLE[(pos + 1) % N_LABEL_CYCLE]);
+}
+
+/* Copy src into dst as a CSV-safe marker token: [a-z0-9_-]. Returns dst, or
+ * the label-dependent default if nothing usable remains. */
+static const char *defaultEventMarker()
+{
+  return (currentLabel == LABEL_WET) ? WET_WATER_MARKER : "event_marker";
+}
+
+static const char *sanitizeMarker(char *dst, size_t dstLen, const char *src)
+{
+  if (!dst || dstLen < 2) return defaultEventMarker();
+  size_t n = 0;
+  if (src) {
+    for (const char *p = src; *p && n + 1 < dstLen; p++) {
+      char c = *p;
+      if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+      if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+          c == '_' || c == '-') {
+        dst[n++] = c;
+      } else if (c == ' ' || c == ',' || c == '/' || c == '.') {
+        if (n && dst[n - 1] != '_') dst[n++] = '_';
+      }
+    }
+  }
+  while (n && dst[n - 1] == '_') n--;
+  dst[n] = '\0';
+  return n ? dst : defaultEventMarker();
+}
+
+static void dropEventMarker(const char *name)
+{
+  if (!name || !name[0]) name = defaultEventMarker();
+  if (!strcmp(name, WET_WATER_MARKER)) {
+    Serial.println(F("\n[EVENT] water_10ml  (10 mL water added to the cage)"));
+  } else {
+    Serial.printf("\n[EVENT] %s\n", name);
+  }
+  logMarker(name);
+  ledFlash(200);
+}
+
+static void printStatus()
+{
+  char iso[24];
+  nowIso(iso, sizeof(iso));
+  Serial.printf("[STATUS] %s ms=%lu label=%s prof=%u '%s' rotate=%s "
+                "cyc=%lu sd=%s sensors=%u/%u\n",
+                iso[0] ? iso : "(no-rtc)",
+                (unsigned long)millis(),
+                LABEL_NAMES[currentLabel],
+                (unsigned)currentProfile,
+                PROFILES[currentProfile].name,
+                profileRotate ? "on" : "off",
+                (unsigned long)profileCycle,
+                sdOk ? "ok" : "FAIL",
+                (unsigned)nSensorsOk, (unsigned)N_KIT_SENS);
+}
+
+static void printHelp()
+{
+  Serial.println(F("[CMD] serial commands (type + Enter):"));
+  Serial.println(F("  Serial Monitor: 115200 baud, line ending = Newline"));
+  Serial.println(F("  help                 this list"));
+  Serial.println(F("  status               current label, profile, sd"));
+  Serial.println(F("  label                cycle AIR -> CLEAN -> WET -> SOILED"));
+  Serial.println(F("  label NAME           set AIR, CLEAN, WET or SOILED"));
+  Serial.println(F("  air | clean | wet | soiled"));
+  Serial.println(F("  mark [name]          event marker (WET defaults to water_10ml)"));
+  Serial.println(F("  profile              list heater profiles"));
+  Serial.println(F("  profile ID|NAME      switch to that profile"));
+  Serial.println(F("  rotate on|off        auto-rotate profiles (default on)"));
+  Serial.println(F("Buttons: A cycles label. B marks an event"));
+  Serial.println(F("         (while WET: 10 mL water added to the cage)."));
+}
+
+static int parseLabelName(const char *s)
+{
+  if (!s || !s[0]) return -1;
+  if (!strcasecmp(s, "unknown")) return (int)LABEL_AIR;
+  for (uint8_t i = 0; i < LABEL_COUNT; i++) {
+    if (strcasecmp(LABEL_NAMES[i], s) == 0) return (int)i;
+  }
+  if (s[0] >= '0' && s[0] < (char)('0' + LABEL_COUNT) && s[1] == '\0') {
+    return (int)(s[0] - '0');
+  }
+  return -1;
+}
+
+static void listProfiles()
+{
+  Serial.printf("[PROFILE] current=%u '%s'  rotate=%s  hold=%lu s\n",
+                (unsigned)currentProfile, PROFILES[currentProfile].name,
+                profileRotate ? "on" : "off",
+                (unsigned long)(PROFILE_ROTATE_MS / 1000UL));
+  for (uint8_t p = 0; p < N_PROFILES; p++) {
+    Serial.printf("  %u %s%s\n", (unsigned)p, PROFILES[p].name,
+                  p == currentProfile ? "  <--" : "");
+  }
+}
+
+static bool selectProfile(const char *arg)
+{
+  if (!arg || !arg[0]) {
+    listProfiles();
+    return true;
+  }
+
+  int idx = -1;
+  char *end = NULL;
+  unsigned long v = strtoul(arg, &end, 10);
+  if (end != arg && *end == '\0' && v < N_PROFILES) {
+    idx = (int)v;
+  } else {
+    for (uint8_t p = 0; p < N_PROFILES; p++) {
+      if (strcasecmp(PROFILES[p].name, arg) == 0) {
+        idx = (int)p;
+        break;
+      }
+    }
+  }
+
+  if (idx < 0) {
+    Serial.printf("[CMD] unknown profile '%s' - try `profile` for the list\n",
+                  arg);
+    return false;
+  }
+  if ((uint8_t)idx == currentProfile) {
+    Serial.printf("[PROFILE] already %u '%s'\n",
+                  (unsigned)idx, PROFILES[idx].name);
+    return true;
+  }
+
+  sdFlush(true);
+  applyProfile((uint8_t)idx);
+  lastSampleMs = millis();
+  return true;
+}
+
+/* ===========================================================================
  * Buttons
  * ===========================================================================
  */
@@ -615,22 +886,128 @@ static void serviceButtons()
 
   bool a = digitalRead(PIN_BTN_A);          /* active low */
   if (btnAPrev && !a && (now - btnALastMs) > BTN_DEBOUNCE_MS) {
-    btnALastMs   = now;
-    currentLabel = (uint8_t)((currentLabel + 1) % LABEL_COUNT);
-    Serial.printf("\n[LABEL] now %s\n", LABEL_NAMES[currentLabel]);
-    logMarker("label_change");
-    ledFlash(200);
+    btnALastMs = now;
+    cycleLabel();
   }
   btnAPrev = a;
 
   bool b = digitalRead(PIN_BTN_B);
   if (btnBPrev && !b && (now - btnBLastMs) > BTN_DEBOUNCE_MS) {
     btnBLastMs = now;
-    Serial.println(F("\n[EVENT] marker"));
-    logMarker("event_marker");
-    ledFlash(200);
+    dropEventMarker(NULL);
   }
   btnBPrev = b;
+}
+
+/* ===========================================================================
+ * Serial commands
+ * ===========================================================================
+ */
+
+static void handleSerialCommand(char *line)
+{
+  while (*line == ' ' || *line == '\t') line++;
+  char *end = line + strlen(line);
+  while (end > line && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+  if (!*line) return;
+
+  char *arg = line;
+  while (*arg && *arg != ' ' && *arg != '\t') arg++;
+  if (*arg) {
+    *arg++ = '\0';
+    while (*arg == ' ' || *arg == '\t') arg++;
+  }
+
+  for (char *p = line; *p; p++) {
+    if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+  }
+
+  if (!strcmp(line, "help") || !strcmp(line, "?")) {
+    printHelp();
+    return;
+  }
+  if (!strcmp(line, "status") || !strcmp(line, "st")) {
+    printStatus();
+    return;
+  }
+  if (!strcmp(line, "label") || !strcmp(line, "l") || !strcmp(line, "a")) {
+    if (!arg[0] || !strcmp(line, "a")) {
+      cycleLabel();
+      return;
+    }
+    for (char *p = arg; *p; p++) {
+      if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+    }
+    int lab = parseLabelName(arg);
+    if (lab < 0) {
+      Serial.println(F("[CMD] label must be AIR, CLEAN, WET or SOILED"));
+      return;
+    }
+    setLabel((uint8_t)lab);
+    return;
+  }
+  if (!strcmp(line, "clean") || !strcmp(line, "soiled") ||
+      !strcmp(line, "wet") || !strcmp(line, "air") ||
+      !strcmp(line, "unknown")) {
+    setLabel((uint8_t)parseLabelName(line));
+    return;
+  }
+  if (!strcmp(line, "mark") || !strcmp(line, "marker") ||
+      !strcmp(line, "event") || !strcmp(line, "m") || !strcmp(line, "b")) {
+    if (!arg[0] || !strcmp(line, "b")) {
+      dropEventMarker(NULL);
+      return;
+    }
+    char buf[32];
+    dropEventMarker(sanitizeMarker(buf, sizeof(buf), arg));
+    return;
+  }
+  if (!strcmp(line, "profile") || !strcmp(line, "prof") ||
+      !strcmp(line, "p")) {
+    selectProfile(arg);
+    return;
+  }
+  if (!strcmp(line, "rotate")) {
+    if (!arg[0]) {
+      Serial.printf("[CMD] rotate is %s\n", profileRotate ? "on" : "off");
+      return;
+    }
+    for (char *p = arg; *p; p++) {
+      if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+    }
+    if (!strcmp(arg, "on") || !strcmp(arg, "1") || !strcmp(arg, "auto")) {
+      profileRotate = true;
+      profileStartMs = millis();   /* start a fresh hold from now */
+      Serial.println(F("[CMD] profile rotate on"));
+    } else if (!strcmp(arg, "off") || !strcmp(arg, "0") ||
+               !strcmp(arg, "hold")) {
+      profileRotate = false;
+      Serial.println(F("[CMD] profile rotate off - holding current profile"));
+    } else {
+      Serial.println(F("[CMD] rotate on|off"));
+    }
+    return;
+  }
+
+  Serial.printf("[CMD] unknown '%s' - type help\n", line);
+}
+
+static void serviceSerial()
+{
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialLineLen == 0) continue;   /* extra CR/LF from "Both NL & CR" */
+      serialLine[serialLineLen] = '\0';
+      serialLineLen = 0;
+      handleSerialCommand(serialLine);
+    } else if (c == 0x08 || c == 0x7F) {  /* backspace / delete */
+      if (serialLineLen > 0) serialLineLen--;
+    } else if (serialLineLen + 1 < SERIAL_LINE_MAX) {
+      serialLine[serialLineLen++] = c;
+    }
+    /* overflow: drop extra chars until the line ends */
+  }
 }
 
 /* ===========================================================================
@@ -661,8 +1038,12 @@ static void setupSerialBanner()
     Serial.println();
   }
   Serial.println(F("--------------------------------------------------------"));
-  Serial.println(F("  Button A (GPIO 14): cycle label UNKNOWN/CLEAN/SOILED"));
-  Serial.println(F("  Button B (GPIO 32): drop an event marker"));
+  Serial.println(F("  Button A (GPIO 14): cycle AIR/CLEAN/WET/SOILED"));
+  Serial.println(F("  Button B (GPIO 32): event (WET = 10 mL water added)"));
+  Serial.println(F("  Serial: type help  (air / clean / wet / soiled / mark)"));
+  Serial.println(F("          115200 baud, set line ending to Newline"));
+  Serial.println(F("  LED: breathe=AIR  2=CLEAN  3=WET  4=SOILED"));
+  Serial.println(F("       fast blink = SD fail"));
   Serial.println(F("========================================================"));
 }
 
@@ -797,7 +1178,12 @@ void setup()
   lastSummaryMs = millis();
   lastSdFlushMs = millis();
 
+  loggingRun = true;
+  ledResetPattern();
+
   Serial.println(F("[RUN] logging started"));
+  Serial.println(F("[RUN] type help + Enter for serial commands"));
+  Serial.println(F("[RUN] LED: breathe=AIR  2=CLEAN  3=WET  4=SOILED"));
 }
 
 /* ===========================================================================
@@ -892,6 +1278,7 @@ void loop()
 {
   uint32_t now = millis();
 
+  serviceSerial();
   serviceButtons();
   serviceLed();
 
@@ -902,7 +1289,8 @@ void loop()
     sampleAllSensors();
   }
 
-  if (now - profileStartMs >= PROFILE_ROTATE_MS && N_PROFILES > 1) {
+  if (profileRotate &&
+      now - profileStartMs >= PROFILE_ROTATE_MS && N_PROFILES > 1) {
     sdFlush(true);
     applyProfile((uint8_t)((currentProfile + 1) % N_PROFILES));
     lastSampleMs = millis();
